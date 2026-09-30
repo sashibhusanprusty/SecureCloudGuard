@@ -2,16 +2,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import secrets
+import sys
 import time
 from pathlib import Path
+from statistics import NormalDist
 
 import joblib
 import numpy as np
 import pandas as pd
 from PIL import Image
 
-from encrypt import aes_encrypt_bytes, logistic_map_key_iv, split_bitplanes
-from svm_selector import plane_feature_vector
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.encrypt import aes_encrypt_bytes, logistic_map_key_iv, split_bitplanes
+from src.svm_selector import plane_feature_vector
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +27,44 @@ DEFAULT_TRAFFIC_CSV = PROJECT_ROOT / "data" / "Friday-WorkingHours-Afternoon-DDo
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "outputs" / "rf_model.pkl"
 DEFAULT_SVM_PATH = PROJECT_ROOT / "outputs" / "svm_selector.pkl"
 DEFAULT_IMAGE_PATH = PROJECT_ROOT / "data" / "images"
+GAUSSIAN_DP_DELTA = 1e-5
+
+
+def apply_differential_privacy(true_count: int | float, epsilon: float) -> float:
+    """Add Gaussian noise calibrated for (epsilon, 1e-5)-DP at sensitivity 1."""
+    try:
+        count = float(true_count)
+        epsilon_value = float(epsilon)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("true_count and epsilon must be finite numbers") from exc
+    if not math.isfinite(count) or count < 0:
+        raise ValueError("true_count must be a finite, non-negative number")
+    if not math.isfinite(epsilon_value) or epsilon_value <= 0:
+        raise ValueError("epsilon must be a finite number greater than zero")
+
+    normal = NormalDist()
+    epsilon_exp = math.exp(epsilon_value)
+
+    def delta_for_sigma(sigma: float) -> float:
+        mu = 1.0 / sigma
+        first = normal.cdf(mu / 2.0 - epsilon_value / mu)
+        second = epsilon_exp * normal.cdf(-mu / 2.0 - epsilon_value / mu)
+        return max(0.0, first - second)
+
+    lower_sigma = 0.0
+    upper_sigma = 1.0
+    while delta_for_sigma(upper_sigma) > GAUSSIAN_DP_DELTA:
+        upper_sigma *= 2.0
+
+    for _ in range(80):
+        sigma = (lower_sigma + upper_sigma) / 2.0
+        if delta_for_sigma(sigma) > GAUSSIAN_DP_DELTA:
+            lower_sigma = sigma
+        else:
+            upper_sigma = sigma
+
+    noise = secrets.SystemRandom().gauss(0.0, upper_sigma)
+    return count + noise
 
 
 def load_feature_columns(csv_path: str | Path = DEFAULT_TRAFFIC_CSV) -> list[str]:

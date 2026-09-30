@@ -1,10 +1,11 @@
 from pathlib import Path
+import json
 
 import joblib
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, confusion_matrix, precision_score, recall_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 
 
 def main() -> None:
@@ -32,16 +33,31 @@ def main() -> None:
         max_depth=12,
         random_state=42,
     )
+    cv_scores = cross_val_score(
+        model,
+        X,
+        y,
+        cv=StratifiedKFold(n_splits=5),
+        scoring="accuracy",
+    )
     model.fit(X_train, y_train)
 
     y_pred = model.predict(X_test)
 
     acc = accuracy_score(y_test, y_pred)
+    train_acc = model.score(X_train, y_train)
+    cv_mean = cv_scores.mean()
+    cv_std = cv_scores.std()
     precision = precision_score(y_test, y_pred, zero_division=0)
     recall = recall_score(y_test, y_pred, zero_division=0)
     cm = confusion_matrix(y_test, y_pred)
 
-    print(f"Accuracy: {acc:.4f}")
+    print(f"Training Accuracy: {train_acc:.4f}")
+    print(f"Test Accuracy: {acc:.4f}")
+    for fold_index, fold_accuracy in enumerate(cv_scores, start=1):
+        print(f"Fold {fold_index} Accuracy: {fold_accuracy:.4f}")
+    print(f"5-Fold CV Mean Accuracy: {cv_mean:.4f}")
+    print(f"5-Fold CV Standard Deviation: {cv_std:.4f}")
     print(f"Precision: {precision:.4f}")
     print(f"Recall: {recall:.4f}")
     print("Confusion Matrix:")
@@ -60,6 +76,17 @@ def main() -> None:
     output_dir = Path(__file__).resolve().parents[1] / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, output_dir / "rf_model.pkl")
+    metrics = {
+        "dataset_samples": int(len(y)),
+        "training_accuracy": float(train_acc),
+        "test_accuracy": float(acc),
+        "cv_folds": [float(score) for score in cv_scores],
+        "cv_mean_accuracy": float(cv_mean),
+        "cv_std_accuracy": float(cv_std),
+    }
+    metrics_path = output_dir / "rf_metrics.json"
+    metrics_path.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+    print(f"Evaluation metrics saved to: {metrics_path}")
     print(f"\nModel saved to: {output_dir / 'rf_model.pkl'}")
 
 

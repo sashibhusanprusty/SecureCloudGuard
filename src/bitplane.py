@@ -99,3 +99,16 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def split_image_channels(image: np.ndarray) -> list[np.ndarray]:
+    """Return a list of 2D channel arrays for an image.
+
+    If the input is grayscale (2D) returns a single-item list.
+    If the input is RGB (H,W,3) returns [R, G, B].
+    """
+    if image.ndim == 2:
+        return [image]
+    if image.ndim == 3 and image.shape[2] >= 3:
+        return [image[:, :, ch].astype(np.uint8) for ch in range(3)]
+    raise ValueError(f"Unsupported image shape: {image.shape}")

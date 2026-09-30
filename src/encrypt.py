@@ -82,6 +82,59 @@ def encrypt_selected_bitplanes(image: np.ndarray, selected: list[int], key: byte
     return encrypted
 
 
+def encrypt_image(image: np.ndarray, seed_base: float = 0.73) -> tuple[np.ndarray, dict]:
+    """Encrypt an image (grayscale or RGB) using selective bit-plane AES.
+
+    Returns (encrypted_image, meta) where `meta` contains per-channel selected planes,
+    encrypted byte blobs, and key/iv used for each channel.
+    """
+    meta = {"channels": []}
+
+    # Convert color images to grayscale and run the single-channel pipeline
+    if image.ndim == 3 and image.shape[2] >= 3:
+        # use luminance formula to convert to grayscale
+        r = image[:, :, 0].astype(np.float32)
+        g = image[:, :, 1].astype(np.float32)
+        b = image[:, :, 2].astype(np.float32)
+        gray = (0.2989 * r + 0.5870 * g + 0.1140 * b).astype(np.uint8)
+        image = gray
+
+    if image.ndim == 2:
+        selected = select_planes(image)
+        key, iv = logistic_map_key_iv(seed=seed_base)
+        bitplanes = split_bitplanes(image)
+        encrypted = {bit: aes_encrypt_bytes(bitplanes[bit].astype(np.uint8).tobytes(), key, iv) for bit in selected}
+        composite = build_encrypted_composite(image, bitplanes, selected, encrypted)
+        meta["channels"].append({"selected": selected, "encrypted": encrypted, "key": key, "iv": iv})
+        return composite, meta
+
+    raise ValueError("Unsupported image array shape for encryption")
+
+
+def decrypt_image(original_image: np.ndarray, meta: dict) -> np.ndarray:
+    """Decrypt an image previously processed by `encrypt_image`.
+
+    `meta` should be the dictionary returned by `encrypt_image`.
+    """
+    # If color image provided, convert to grayscale first (we only support single-channel pipeline)
+    if original_image.ndim == 3 and original_image.shape[2] >= 3:
+        r = original_image[:, :, 0].astype(np.float32)
+        g = original_image[:, :, 1].astype(np.float32)
+        b = original_image[:, :, 2].astype(np.float32)
+        original_image = (0.2989 * r + 0.5870 * g + 0.1140 * b).astype(np.uint8)
+
+    if original_image.ndim == 2:
+        info = meta["channels"][0]
+        selected = info["selected"]
+        encrypted = info["encrypted"]
+        key = info["key"]
+        iv = info["iv"]
+        rebuilt = decrypt_roundtrip(original_image, selected, encrypted, key, iv)
+        return rebuilt
+
+    raise ValueError("Unsupported image array shape for decryption")
+
+
 def build_encrypted_composite(image: np.ndarray, bitplanes: list[np.ndarray], selected: list[int], encrypted: dict[int, bytes]) -> np.ndarray:
     composite = np.zeros_like(image, dtype=np.uint8)
     for bit in range(8):
@@ -105,6 +158,35 @@ def decrypt_roundtrip(image: np.ndarray, selected: list[int], encrypted: dict[in
             plane = bitplanes[bit]
         rebuilt = rebuilt | ((plane.astype(np.uint8) & 1) << bit)
     return rebuilt
+
+
+def shannon_entropy(image: np.ndarray) -> float:
+    if image.size == 0:
+        return 0.0
+    hist, _ = np.histogram(image.ravel(), bins=256, range=(0, 256))
+    probs = hist / hist.sum()
+    probs = probs[probs > 0]
+    return float(-np.sum(probs * np.log2(probs)))
+
+
+def compute_npcr_uaci(original: np.ndarray, encrypted: np.ndarray) -> tuple[float, float]:
+    if original.shape != encrypted.shape:
+        raise ValueError(f"Image shapes differ: {original.shape} vs {encrypted.shape}")
+
+    diff = original.astype(np.int32) != encrypted.astype(np.int32)
+    npcr = float(np.mean(diff) * 100.0)
+    uaci = float(np.mean(np.abs(original.astype(np.int32) - encrypted.astype(np.int32))) / 255.0 * 100.0)
+    return npcr, uaci
+
+
+def image_security_metrics(original: np.ndarray, encrypted: np.ndarray) -> dict[str, float]:
+    npcr, uaci = compute_npcr_uaci(original, encrypted)
+    return {
+        "npcr": npcr,
+        "uaci": uaci,
+        "entropy_original": shannon_entropy(original),
+        "entropy_encrypted": shannon_entropy(encrypted),
+    }
 
 
 def main() -> None:
@@ -168,7 +250,13 @@ def main() -> None:
 
     reconstructed = decrypt_roundtrip(image, selected, encrypted, key, iv)
     exact_match = np.array_equal(reconstructed, image)
+    security = image_security_metrics(image, encrypted_composite)
+
     print(f"\nRound-trip exact match for output image: {exact_match}")
+    print(f"NPCR (original vs encrypted): {security['npcr']:.4f}%")
+    print(f"UACI (original vs encrypted): {security['uaci']:.4f}%")
+    print(f"Shannon entropy (original): {security['entropy_original']:.4f}")
+    print(f"Shannon entropy (encrypted): {security['entropy_encrypted']:.4f}")
     print(f"Saved encrypted composite to: {output_dir / 'encrypted_composite.png'}")
 
     if not exact_match:
