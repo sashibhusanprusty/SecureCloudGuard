@@ -27,7 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.pipeline import apply_differential_privacy, run_system_run
 from src.bayesian_predictor import evidence_from_traffic_row, predict_attack_probability
 
-DATASET_PATH = PROJECT_ROOT / "data" / "Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv"
+SAMPLE_DATASET_PATH = PROJECT_ROOT / "data" / "sample_ddos.csv"
 RF_METRICS_PATH = PROJECT_ROOT / "outputs" / "rf_metrics.json"
 CLOUD_STORAGE_DIR = PROJECT_ROOT / "cloud_storage"
 DEFAULT_SAMPLE_ROW = {}
@@ -318,7 +318,7 @@ def inject_theme() -> None:
 
 
 def load_dataset_sample() -> pd.DataFrame:
-    df = pd.read_csv(DATASET_PATH)
+    df = pd.read_csv(SAMPLE_DATASET_PATH)
     df.columns = df.columns.map(lambda col: str(col).strip())
     df = df.replace([float("inf"), float("-inf")], float("nan")).dropna()
     return df
