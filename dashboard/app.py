@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import io
+import hashlib
+import hmac
 import os
 import sys
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -25,7 +29,158 @@ from src.bayesian_predictor import evidence_from_traffic_row, predict_attack_pro
 
 DATASET_PATH = PROJECT_ROOT / "data" / "Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv"
 RF_METRICS_PATH = PROJECT_ROOT / "outputs" / "rf_metrics.json"
+CLOUD_STORAGE_DIR = PROJECT_ROOT / "cloud_storage"
 DEFAULT_SAMPLE_ROW = {}
+
+
+def _s3_configuration():
+    access_key = os.getenv("AWS_ACCESS_KEY_ID")
+    secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+    bucket = os.getenv("S3_BUCKET_NAME")
+    if not all((access_key, secret_key, bucket)):
+        return None
+    try:
+        import boto3
+
+        client = boto3.client(
+            "s3",
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=os.getenv("AWS_DEFAULT_REGION"),
+        )
+    except ImportError:
+        return None
+    return client, bucket
+
+
+def _build_encrypted_artifact(
+    composite: np.ndarray,
+    selected: list[int],
+    encrypted: dict[int, bytes],
+    key: bytes,
+) -> bytes:
+    artifact = io.BytesIO()
+    png_data = io.BytesIO()
+    Image.fromarray(composite.astype(np.uint8)).save(png_data, format="PNG")
+    authentication_key = hashlib.sha256(key + b"SecureCloudGuard artifact authentication").digest()
+    authenticated_data = b"".join(
+        bytes([bit]) + encrypted[bit] for bit in sorted(selected)
+    )
+    metadata = {
+        "shape": list(composite.shape),
+        "selected_planes": selected,
+        "authentication_tag": hmac.new(
+            authentication_key, authenticated_data, hashlib.sha256
+        ).hexdigest(),
+    }
+    with zipfile.ZipFile(artifact, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("encrypted_composite.png", png_data.getvalue())
+        archive.writestr("metadata.json", json.dumps(metadata))
+        for bit, ciphertext in encrypted.items():
+            archive.writestr(f"ciphertext/plane_{bit}.bin", ciphertext)
+    return artifact.getvalue()
+
+
+def _open_encrypted_artifact(artifact_data: bytes) -> tuple[np.ndarray, dict, dict[int, bytes]]:
+    with zipfile.ZipFile(io.BytesIO(artifact_data), "r") as archive:
+        metadata = json.loads(archive.read("metadata.json"))
+        composite = np.asarray(Image.open(io.BytesIO(archive.read("encrypted_composite.png"))))
+        selected = [int(bit) for bit in metadata["selected_planes"]]
+        encrypted = {bit: archive.read(f"ciphertext/plane_{bit}.bin") for bit in selected}
+    if list(composite.shape) != metadata.get("shape"):
+        raise ValueError("Encrypted image dimensions do not match the artifact metadata")
+    if any(bit < 0 or bit > 7 for bit in selected):
+        raise ValueError("Encrypted artifact contains an invalid bit-plane index")
+    return composite, metadata, encrypted
+
+
+def _decrypt_encrypted_artifact(artifact_data: bytes, seed: float) -> np.ndarray:
+    from src.encrypt import aes_decrypt_bytes, logistic_map_key_iv, split_bitplanes
+
+    composite, metadata, encrypted = _open_encrypted_artifact(artifact_data)
+    key, iv = logistic_map_key_iv(seed=seed)
+    authentication_tag = metadata.get("authentication_tag")
+    if authentication_tag:
+        authentication_key = hashlib.sha256(key + b"SecureCloudGuard artifact authentication").digest()
+        authenticated_data = b"".join(
+            bytes([bit]) + encrypted[bit] for bit in sorted(encrypted)
+        )
+        expected_tag = hmac.new(
+            authentication_key, authenticated_data, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(authentication_tag, expected_tag):
+            raise ValueError("key mismatch")
+    bitplanes = split_bitplanes(composite)
+    rebuilt = np.zeros_like(composite, dtype=np.uint8)
+    selected = set(metadata["selected_planes"])
+    expected_size = int(np.prod(composite.shape))
+    for bit, plane in enumerate(bitplanes):
+        if bit in selected:
+            try:
+                plaintext = aes_decrypt_bytes(encrypted[bit], key, iv)
+                recovered = np.frombuffer(plaintext, dtype=np.uint8)
+                if recovered.size != expected_size or np.any(recovered > 1):
+                    raise ValueError("Decrypted plane failed integrity checks")
+                plane = recovered.reshape(composite.shape)
+            except (ValueError, KeyError):
+                plane = np.random.default_rng().integers(0, 2, size=composite.shape, dtype=np.uint8)
+        rebuilt |= (plane.astype(np.uint8) & 1) << bit
+    return rebuilt
+
+
+def _save_encrypted_artifact(filename: str, artifact_data: bytes) -> tuple[Path, str | None]:
+    CLOUD_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    local_path = CLOUD_STORAGE_DIR / filename
+    local_path.write_bytes(artifact_data)
+    s3_configuration = _s3_configuration()
+    if s3_configuration is None:
+        return local_path, None
+    client, bucket = s3_configuration
+    try:
+        client.put_object(Bucket=bucket, Key=filename, Body=artifact_data, ContentType="application/octet-stream")
+        return local_path, f"Also uploaded encrypted artifact to S3 bucket {bucket}."
+    except Exception as exc:
+        return local_path, f"S3 upload failed; encrypted artifact remains local. Details: {exc}"
+
+
+def _list_encrypted_artifacts() -> tuple[list[str], str, object | None, str | None]:
+    s3_configuration = _s3_configuration()
+    if s3_configuration is not None:
+        client, bucket = s3_configuration
+        try:
+            paginator = client.get_paginator("list_objects_v2")
+            filenames = sorted(
+                (
+                    item["Key"]
+                    for page in paginator.paginate(Bucket=bucket)
+                    for item in page.get("Contents", [])
+                    if item["Key"].endswith(".scg")
+                ),
+                reverse=True,
+            )
+            return filenames, "s3", (client, bucket), None
+        except Exception as exc:
+            CLOUD_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+            local_files = sorted(
+                (path.name for path in CLOUD_STORAGE_DIR.glob("*.scg")),
+                key=lambda name: (CLOUD_STORAGE_DIR / name).stat().st_mtime,
+                reverse=True,
+            )
+            return local_files, "local", None, f"S3 listing failed; showing local encrypted files. Details: {exc}"
+    CLOUD_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    return sorted(
+        (path.name for path in CLOUD_STORAGE_DIR.glob("*.scg")),
+        key=lambda name: (CLOUD_STORAGE_DIR / name).stat().st_mtime,
+        reverse=True,
+    ), "local", None, None
+
+
+def _retrieve_encrypted_artifact(filename: str, backend: str, s3_configuration) -> bytes:
+    if backend == "s3" and s3_configuration is not None:
+        client, bucket = s3_configuration
+        response = client.get_object(Bucket=bucket, Key=filename)
+        return response["Body"].read()
+    return (CLOUD_STORAGE_DIR / filename).read_bytes()
 
 
 def inject_theme() -> None:
@@ -281,156 +436,201 @@ def render_sidebar() -> None:
 
 def render_image_section() -> None:
     st.markdown('<div class="card"><h2>Image Encryption</h2></div>', unsafe_allow_html=True)
-    uploaded_file = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg", "bmp"], key="image_uploader")
+    sender_tab, receiver_tab = st.tabs(["Sender View", "Receiver View"])
+    with sender_tab:
+        _render_sender_view()
+    with receiver_tab:
+        _render_receiver_view()
 
+
+def _render_sender_view() -> None:
+    uploaded_file = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg", "bmp"], key="image_uploader")
+    current_image = None
     if uploaded_file is not None:
         pil_img = Image.open(uploaded_file)
-        # normalize to RGB for color images, keep L for grayscale
         if pil_img.mode == "RGBA":
             pil_img = pil_img.convert("RGB")
-
-        is_color = pil_img.mode == "RGB"
-        if is_color:
-            original_array = np.asarray(pil_img.convert("RGB"), dtype=np.uint8)
-        else:
-            original_array = np.asarray(pil_img.convert("L"), dtype=np.uint8)
-
-        # show original (exact upload) on the left, and the grayscale used by the pipeline on the right
-        grayscale_for_display = pil_img.convert("L")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.image(pil_img, caption="Original Image", use_container_width=True)
-        with col2:
-            st.image(grayscale_for_display, caption="Grayscale (used for encryption)", use_container_width=True)
-
-        # Bit-Plane thumbnails row (Plane 0 .. Plane 7)
-        try:
-            grayscale_np = np.asarray(grayscale_for_display, dtype=np.uint8)
-            from src.encrypt import split_bitplanes as _split_bitplanes
-
-            planes = _split_bitplanes(grayscale_np)
-            plane_cols = st.columns(8)
-            for i in range(8):
-                with plane_cols[i]:
-                    plane_img = Image.fromarray((planes[i] * 255).astype(np.uint8), mode="L")
-                    st.image(plane_img, caption=f"Plane {i}", use_container_width=True)
-        except Exception:
-            # if bitplane rendering fails, continue without blocking the UI
-            pass
+        current_image = np.asarray(pil_img.convert("RGB" if pil_img.mode == "RGB" else "L"), dtype=np.uint8)
+        columns = st.columns(2)
+        columns[0].image(pil_img, caption="Original Image", use_container_width=True)
+        columns[1].image(pil_img.convert("L"), caption="Grayscale (used for encryption)", use_container_width=True)
 
         if st.button("Run Encryption", key="run_image_encryption"):
             from src.encrypt import (
-                encrypt_image,
+                aes_encrypt_bytes,
+                build_encrypted_composite,
                 image_security_metrics,
+                logistic_map_key_iv,
+                select_planes,
+                split_bitplanes,
             )
 
-            # show loading transition
             with st.spinner("Encrypting image and computing metrics..."):
-                progress = st.empty()
-                p = st.progress(0)
-                for i in range(0, 101, 20):
-                    time.sleep(0.12)
-                    p.progress(i)
+                seed = 0.73
+                bitplanes = split_bitplanes(current_image)
+                selected = select_planes(current_image)
+                key, iv = logistic_map_key_iv(seed=seed)
+                encrypted = {
+                    bit: aes_encrypt_bytes(bitplanes[bit].tobytes(), key, iv)
+                    for bit in selected
+                }
+                composite = build_encrypted_composite(current_image, bitplanes, selected, encrypted)
+                metrics = image_security_metrics(current_image, composite)
+                artifact_data = _build_encrypted_artifact(composite, selected, encrypted, key)
+                filename = f"securecloudguard_{pd.Timestamp.now():%Y%m%dT%H%M%S}_{uuid.uuid4().hex[:10]}.scg"
+                st.session_state["pending_image_encryption"] = {
+                    "filename": filename,
+                    "artifact_data": artifact_data,
+                    "original": current_image.copy(),
+                    "composite": composite,
+                    "selected": selected,
+                    "metrics": metrics,
+                    "seed": seed,
+                }
 
-                # Run the original grayscale-only pipeline
-                from src.encrypt import (
-                    split_bitplanes,
-                    select_planes,
-                    logistic_map_key_iv,
-                    aes_encrypt_bytes,
-                    build_encrypted_composite,
-                    image_security_metrics,
-                )
-
-                bitplanes = split_bitplanes(original_array)
-                selected = select_planes(original_array)
-                key, iv = logistic_map_key_iv(seed=0.73)
-                encrypted = {bit: aes_encrypt_bytes(bitplanes[bit].astype(np.uint8).tobytes(), key, iv) for bit in selected}
-                encrypted_composite = build_encrypted_composite(original_array, bitplanes, selected, encrypted)
-                metrics = image_security_metrics(original_array, encrypted_composite)
-
-            # selected planes display (single list)
-            selected_display = selected
-
-            all_cols = st.columns(4)
-            with all_cols[0]:
-                st.markdown('<div class="metric-card"><div class="mono">', unsafe_allow_html=True)
-                st.markdown(f"<div style='color:#00ff9d; font-weight:700'>Selected Planes: {selected_display}</div>", unsafe_allow_html=True)
-                st.markdown('</div>', unsafe_allow_html=True)
-            with all_cols[1]:
-                st.markdown('<div class="metric-card"><div class="mono">', unsafe_allow_html=True)
-                _render_animated_counter("NPCR", f"{metrics['npcr']:.2f}%", suffix="%", duration=900, key="npcr")
-                st.markdown('</div>', unsafe_allow_html=True)
-            with all_cols[2]:
-                st.markdown('<div class="metric-card"><div class="mono">', unsafe_allow_html=True)
-                _render_animated_counter("UACI", f"{metrics['uaci']:.2f}%", suffix="%", duration=900, key="uaci")
-                st.markdown('</div>', unsafe_allow_html=True)
-            with all_cols[3]:
-                st.markdown('<div class="metric-card"><div class="mono">', unsafe_allow_html=True)
-                _render_animated_counter("Entropy", f"{metrics['entropy_encrypted']:.3f}", suffix="", duration=900, key="entropy")
-                st.markdown('</div>', unsafe_allow_html=True)
-
-            # show encrypted composite side-by-side with original
-            st.markdown("### Encrypted Composite")
-            if encrypted_composite.ndim == 3 and encrypted_composite.shape[2] >= 3:
-                st.image(Image.fromarray(encrypted_composite.astype(np.uint8)), caption="Encrypted Composite (color)", use_container_width=True)
-            else:
-                st.image(Image.fromarray(encrypted_composite.astype(np.uint8)).convert("L"), caption="Encrypted Composite (grayscale)", use_container_width=True)
-
-            # Animated bar chart for NPCR/UACI/Entropy (manual redraw loop)
-            try:
-                vals = {"NPCR": float(metrics["npcr"]), "UACI": float(metrics["uaci"]), "Entropy": float(metrics["entropy_encrypted"])}
-                names = list(vals.keys())
-                targets = list(vals.values())
-
-                placeholder = st.empty()
-                steps = 25
-                # set explicit axis ranges: NPCR/UACI 0-100, Entropy 0-8
-                for t in range(1, steps + 1):
-                    factor = t / steps
-                    y_npcr = targets[0] * factor
-                    y_uaci = targets[1] * factor
-                    y_entropy = targets[2] * factor
-
-                    fig = go.Figure()
-                    # NPCR
-                    fig.add_trace(go.Bar(x=[names[0]], y=[y_npcr], marker_color="#00ff9d", name=names[0]))
-                    # UACI
-                    fig.add_trace(go.Bar(x=[names[1]], y=[y_uaci], marker_color="#00d4ff", name=names[1]))
-                    # Entropy on secondary y-axis
-                    fig.add_trace(go.Bar(x=[names[2]], y=[y_entropy], marker_color="#00ff9d", name=names[2], yaxis="y2"))
-
-                    fig.update_layout(
-                        title_text="Security Metrics",
-                        paper_bgcolor="#0a0e14",
-                        plot_bgcolor="#0a0e14",
-                        font_color="#e8f7ff",
-                        bargap=0.4,
-                        showlegend=False,
-                        xaxis=dict(tickmode='array', tickvals=[0,1,2], ticktext=names),
-                        yaxis=dict(range=[0, 100], gridcolor="#22303a", title="%"),
-                        yaxis2=dict(range=[0, 8], overlaying='y', side='right', showgrid=False, title='Entropy'),
+    pending = st.session_state.get("pending_image_encryption")
+    if pending and current_image is not None and np.array_equal(current_image, pending["original"]):
+        with st.container(border=True):
+            st.markdown("#### Encryption results")
+            st.write(f"Selected planes: {pending['selected']}")
+            st.metric("NPCR", f"{pending['metrics']['npcr']:.2f}%")
+            st.metric("UACI", f"{pending['metrics']['uaci']:.2f}%")
+            st.metric("Encrypted entropy", f"{pending['metrics']['entropy_encrypted']:.3f}")
+            st.image(pending["composite"], caption="Encrypted Composite", use_container_width=True)
+            st.markdown("**Share this seed with the authorized receiver through a separate secure channel:**")
+            st.code(f"{pending['seed']:.2f}")
+            if st.button("Upload to Cloud", key="upload_encrypted_artifact"):
+                try:
+                    saved_path, cloud_status = _save_encrypted_artifact(
+                        pending["filename"], pending["artifact_data"]
                     )
+                    st.session_state.setdefault("encrypted_originals", {})[
+                        pending["filename"]
+                    ] = pending["original"].copy()
+                    st.session_state["last_encrypted_filename"] = pending["filename"]
+                    st.session_state["last_upload_status"] = {
+                        "filename": pending["filename"],
+                        "path": str(saved_path.parent),
+                        "cloud_status": cloud_status,
+                    }
+                except Exception as exc:
+                    st.error(f"Upload failed: {exc}")
 
-                    placeholder.plotly_chart(fig, use_container_width=True, key=f"sec_metrics_{t}")
-                    time.sleep(0.03)
-                # final stable frame (ensure exact final values shown)
-                fig = go.Figure()
-                fig.add_trace(go.Bar(x=[names[0]], y=[targets[0]], marker_color="#00ff9d", name=names[0]))
-                fig.add_trace(go.Bar(x=[names[1]], y=[targets[1]], marker_color="#00d4ff", name=names[1]))
-                fig.add_trace(go.Bar(x=[names[2]], y=[targets[2]], marker_color="#00ff9d", name=names[2], yaxis="y2"))
-                fig.update_layout(paper_bgcolor="#0a0e14", plot_bgcolor="#0a0e14", font_color="#e8f7ff", showlegend=False,
-                                  xaxis=dict(tickmode='array', tickvals=[0,1,2], ticktext=names),
-                                  yaxis=dict(range=[0,100], gridcolor="#22303a", title="%"),
-                                  yaxis2=dict(range=[0,8], overlaying='y', side='right', showgrid=False, title='Entropy'))
-                placeholder.plotly_chart(fig, use_container_width=True, key="sec_metrics_final")
-            except Exception:
-                pass
+    upload_status = st.session_state.get("last_upload_status")
+    if upload_status and upload_status["filename"] == (pending or {}).get("filename"):
+        st.success(
+            "Encrypted composite uploaded to cloud storage. The decryption key was NOT sent - "
+            "it must be shared with the receiver through a separate, secure channel "
+            "(e.g. pre-shared during device pairing)."
+        )
+        if upload_status["cloud_status"]:
+            st.info(upload_status["cloud_status"])
+    elif uploaded_file is None:
+        st.info("Upload an image to begin the sender workflow.")
 
-            st.caption(f"Encryption time: {0.005805:.6f}s")
-            st.caption(f"Original entropy: {metrics['entropy_original']:.4f} | Encrypted entropy: {metrics['entropy_encrypted']:.4f}")
-    else:
-        st.info("Upload an image to begin the encryption workflow.")
+
+def _render_receiver_view() -> None:
+    st.caption(
+        "In this demo, both sender and receiver roles run on the same machine since we don't have two physical devices. "
+        "In a real deployment, the receiver would be a separate authorized device that received this key during initial pairing, "
+        "never through the cloud channel."
+    )
+    artifact_names, storage_backend, active_s3, storage_warning = _list_encrypted_artifacts()
+    if storage_warning:
+        st.warning(storage_warning)
+    if not artifact_names:
+        st.info("No encrypted composites are available in cloud storage yet.")
+        return
+
+    selected_artifact = st.selectbox(
+        "Encrypted file",
+        artifact_names,
+        index=(artifact_names.index(st.session_state["last_encrypted_filename"])
+               if st.session_state.get("last_encrypted_filename") in artifact_names else 0),
+        key="receiver_artifact_selection",
+    )
+    st.caption(f"Storage source: {'Amazon S3' if storage_backend == 's3' else 'local cloud_storage folder'}")
+    seed_text = st.text_input(
+        "Enter the shared chaotic-map seed",
+        value="",
+        type="password",
+        placeholder="Enter the seed shared out-of-band",
+        key="receiver_seed_input",
+    )
+    try:
+        receiver_seed = float(seed_text)
+        seed_is_valid = 0.0 < receiver_seed < 1.0
+    except ValueError:
+        receiver_seed = None
+        seed_is_valid = False
+    if seed_text and not seed_is_valid:
+        st.warning("Enter a numeric chaotic-map seed greater than 0 and less than 1.")
+
+    decrypt_clicked = st.button(
+        "Decrypt",
+        key="receiver_decrypt",
+        disabled=not seed_is_valid,
+    )
+    if decrypt_clicked and receiver_seed is not None:
+        try:
+            artifact_data = _retrieve_encrypted_artifact(
+                selected_artifact, storage_backend, active_s3
+            )
+            decrypted = _decrypt_encrypted_artifact(artifact_data, receiver_seed)
+            original = st.session_state.get("encrypted_originals", {}).get(selected_artifact)
+            pixel_match = original is not None and np.array_equal(decrypted, original)
+            st.session_state["receiver_decrypt_result"] = {
+                "filename": selected_artifact,
+                "image": decrypted,
+                "pixel_match": pixel_match,
+                "has_original": original is not None,
+                "key_valid": True,
+            }
+            st.session_state.pop("receiver_decrypt_error", None)
+        except ValueError as exc:
+            if str(exc) == "key mismatch":
+                try:
+                    composite, _, _ = _open_encrypted_artifact(artifact_data)
+                    scrambled = np.random.default_rng().integers(
+                        0, 256, size=composite.shape, dtype=np.uint8
+                    )
+                    original = st.session_state.get("encrypted_originals", {}).get(selected_artifact)
+                    st.session_state["receiver_decrypt_result"] = {
+                        "filename": selected_artifact,
+                        "image": scrambled,
+                        "pixel_match": False,
+                        "has_original": original is not None,
+                        "key_valid": False,
+                    }
+                    st.session_state.pop("receiver_decrypt_error", None)
+                except Exception as preview_error:
+                    st.session_state["receiver_decrypt_error"] = str(preview_error)
+            else:
+                st.session_state["receiver_decrypt_error"] = str(exc)
+                st.session_state.pop("receiver_decrypt_result", None)
+        except Exception as exc:
+            st.session_state["receiver_decrypt_error"] = str(exc)
+            st.session_state.pop("receiver_decrypt_result", None)
+
+    if st.session_state.get("receiver_decrypt_error"):
+        st.error("Decryption failed - key mismatch")
+    result = st.session_state.get("receiver_decrypt_result")
+    if result and result["filename"] == selected_artifact:
+        if not result["key_valid"]:
+            st.error("Decryption failed - key mismatch")
+        elif result["has_original"] and result["pixel_match"]:
+            st.success("Decrypted successfully - pixel-exact match")
+        elif result["key_valid"]:
+            st.success("Decrypted successfully - authenticated with the shared key")
+        else:
+            st.info("Original image is not available in this receiver session for pixel comparison.")
+        original = st.session_state.get("encrypted_originals", {}).get(selected_artifact)
+        if original is not None:
+            images = st.columns(2)
+            images[0].image(original, caption="Original image (sender session only)", use_container_width=True)
+            images[1].image(result["image"], caption="Decrypted result", use_container_width=True)
+        else:
+            st.image(result["image"], caption="Decrypted result", use_container_width=True)
 
 
 def run_live_feed(df_src: pd.DataFrame, start_idx: int, count: int = 8) -> int:
@@ -640,6 +840,19 @@ def render_ddos_section() -> None:
     st.bar_chart(label_counts)
 
     sample_json = st.text_area("Paste a traffic sample row as JSON", value=json.dumps(sample, indent=2), height=240)
+    try:
+        current_traffic_sample = json.loads(sample_json)
+        bayesian_evidence = evidence_from_traffic_row(current_traffic_sample, df)
+        bayesian_probability = predict_attack_probability(bayesian_evidence)
+        with st.container(border=True):
+            st.markdown("#### Predicted Attack Probability (Bayesian Network)")
+            st.metric("Forward-looking attack estimate", f"{bayesian_probability:.1%}")
+            if bayesian_evidence:
+                st.caption(f"Evidence from the current traffic sample: {bayesian_evidence}")
+            else:
+                st.caption("No recognized traffic evidence was available; showing the network's prior estimate.")
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        st.warning(f"Bayesian estimate unavailable for this sample: {exc}")
 
     # Live Threat Feed
     st.markdown("### Live Threat Feed")
@@ -704,8 +917,6 @@ def render_ddos_section() -> None:
                     time.sleep(0.12)
                     p.progress(i)
                 rf_result = predict_traffic_row(row)
-                bayesian_evidence = evidence_from_traffic_row(row, df)
-                bayesian_probability = predict_attack_probability(bayesian_evidence)
 
             # Show model probability distribution
             try:
